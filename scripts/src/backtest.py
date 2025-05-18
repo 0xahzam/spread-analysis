@@ -1,6 +1,8 @@
 import json
 import pandas as pd
 import numpy as np
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 
 # read JSON file of OHLCV ‘candles’, parse timestamps and remove duplicates
@@ -165,7 +167,6 @@ def backtest(price_df, ratio, capital, rebalance_freq, VERBOSE=True):
 if __name__ == "__main__":
     ratio = 10  # target 1 DRIFT vs 10 KMNO in synthetic basket
     initial_capital = 1 + ratio  # USD deployed = $1 + $10 = $11
-    update_freq = 4 * 24  # rebalance interval: bars/hr, 1 bar = 15 min, 4 bars = 1 hour
 
     price_df = prepare_df(
         "../data/price/drift_15m_90days.json",
@@ -173,41 +174,119 @@ if __name__ == "__main__":
         ratio,
     )
 
-    # verbose=true for logs
-    trades_df = backtest(price_df, ratio, initial_capital, update_freq, VERBOSE=True)
+    results = []
 
-    # stats
-    net_usd = trades_df["total_pnl_usd"].sum()
-    final_pct = net_usd / initial_capital * 100
+    for update_freq in range(1, 97):  # 1 to 96 (15min to 24h)
+        # verbose=true for logs
+        trades_df = backtest(
+            price_df, ratio, initial_capital, update_freq, VERBOSE=False
+        )
+        # stats
+        net_usd = trades_df["total_pnl_usd"].sum()
+        final_pct = net_usd / initial_capital * 100
+        total_days = (price_df.index[-1] - price_df.index[0]).total_seconds() / 86400
+        trades_per_year = len(trades_df) / total_days * 365
+        returns = trades_df["pnl_pct"]
 
-    total_days = (price_df.index[-1] - price_df.index[0]).total_seconds() / 86400
-    trades_per_year = len(trades_df) / total_days * 365
+        if len(returns) > 0:
+            # sharpe based on per-trade returns
+            avg_hours = (
+                trades_df["exit_time"] - trades_df["entry_time"]
+            ).dt.total_seconds().mean() / 3600
+            rf_annual = 0.0406
+            rf_per_trade = rf_annual * (avg_hours / 8760)
+            excess_ret = returns - rf_per_trade
+            std = excess_ret.std()
+            sharpe = (
+                (excess_ret.mean() / std * np.sqrt(8760 / avg_hours))
+                if std > 1e-8
+                else 0
+            )
+            # equity curve and drawdown
+            equity = trades_df["total_pnl_usd"].cumsum() + initial_capital
+            drawdown = equity / equity.cummax() - 1
+            min_dd = drawdown.min() * 100
+            # win rate
+            win_rate = (returns > 0).mean() * 100
+        else:
+            sharpe = min_dd = win_rate = avg_hours = 0
 
-    # sharpe based on per-trade returns
-    returns = trades_df["pnl_pct"]
-    avg_hours = (
-        trades_df["exit_time"] - trades_df["entry_time"]
-    ).dt.total_seconds().mean() / 3600
-    rf_annual = 0.0406  # treasury rate
-    rf_per_trade = rf_annual * (avg_hours / 8760)
+        results.append(
+            (
+                update_freq,
+                net_usd,
+                final_pct,
+                sharpe,
+                min_dd,
+                win_rate,
+                trades_per_year,
+                avg_hours,
+            )
+        )
 
-    excess_ret = returns - rf_per_trade
-    std = excess_ret.std()
+    df_results = pd.DataFrame(
+        results,
+        columns=[
+            "update_freq",
+            "net_usd",
+            "final_pct",
+            "sharpe",
+            "min_drawdown",
+            "win_rate",
+            "trades_per_year",
+            "avg_hold_hrs",
+        ],
+    )
 
-    sharpe = (excess_ret.mean() / std * np.sqrt(8760 / avg_hours)) if std > 1e-8 else 0
+    # df_results.to_csv("backtest_results.csv", index=False)
 
-    # equity curve and drawdown
-    equity = trades_df["total_pnl_usd"].cumsum() + initial_capital
-    drawdown = equity / equity.cummax() - 1
-    min_dd = drawdown.min() * 100
+    # fig = make_subplots(
+    #     rows=3,
+    #     cols=1,
+    #     shared_xaxes=True,
+    #     vertical_spacing=0.05,
+    #     subplot_titles=["Net PnL (USD)", "Sharpe Ratio", "Min Drawdown (%)"],
+    # )
 
-    # win rate and average hold
-    win_rate = (returns > 0).mean() * 100
-    avg_hold = avg_hours
+    # fig.add_trace(
+    #     go.Scatter(
+    #         x=df_results["update_freq"],
+    #         y=df_results["final_pct"],
+    #         mode="lines+markers",
+    #         name="PnL %",
+    #     ),
+    #     row=1,
+    #     col=1,
+    # )
 
-    print(f"Net P&L: ${net_usd:.2f} ({final_pct:.2f}%)")
-    print(f"Trades/year: {trades_per_year:.1f}")
-    print(f"Sharpe (annualized): {sharpe:.2f}")
-    print(f"Min drawdown: {min_dd:.2f}%")
-    print(f"Win rate: {win_rate:.2f}% over {len(trades_df)} trades")
-    print(f"Avg hold time per trade: {avg_hold:.2f}h")
+    # fig.add_trace(
+    #     go.Scatter(
+    #         x=df_results["update_freq"],
+    #         y=df_results["sharpe"],
+    #         mode="lines+markers",
+    #         name="Sharpe Ratio",
+    #     ),
+    #     row=2,
+    #     col=1,
+    # )
+
+    # fig.add_trace(
+    #     go.Scatter(
+    #         x=df_results["update_freq"],
+    #         y=df_results["min_drawdown"],
+    #         mode="lines+markers",
+    #         name="Min Drawdown",
+    #     ),
+    #     row=3,
+    #     col=1,
+    # )
+
+    # fig.update_layout(
+    #     height=1200,
+    #     title_text="Strategy Metrics by Update Frequency",
+    #     template="plotly_white",
+    #     showlegend=False,
+    #     xaxis3=dict(title="Update Frequency (bars)"),
+    # )
+
+    # fig.write_image("backtest.png", width=1920, height=1080, scale=2)
