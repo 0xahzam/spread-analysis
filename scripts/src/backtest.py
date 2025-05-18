@@ -245,7 +245,7 @@ if __name__ == "__main__":
     #     cols=1,
     #     shared_xaxes=True,
     #     vertical_spacing=0.05,
-    #     subplot_titles=["Net PnL (USD)", "Sharpe Ratio", "Min Drawdown (%)"],
+    #     subplot_titles=["PnL (%)", "Sharpe Ratio", "Min Drawdown (%)"],
     # )
 
     # fig.add_trace(
