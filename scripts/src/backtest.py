@@ -32,8 +32,9 @@ def prepare_df(drift_path, kmno_path, ratio):
 
 # backtest loop using tuple state and clear prints
 # skip flat signal, open initial position, flip on signal change, compute PnL, and final close
-def backtest(price_df, ratio, capital, rebalance_freq, VERBOSE=True):
+def backtest(price_df, ratio, init_drift_amt, rebalance_freq, VERBOSE=True):
     position = None
+    starting_capital = 0
     trades = []
 
     for i in range(0, len(price_df), rebalance_freq):
@@ -46,16 +47,18 @@ def backtest(price_df, ratio, capital, rebalance_freq, VERBOSE=True):
         if signal == 0:  # skip flat signal (no position)
             continue
 
-        if not position:  # open first position: size USD legs in fixed ratio
-            basket_price = row.drift + ratio * row.kmno
-            qty_unit = capital / basket_price
+        if not position:  # open first position: 1:10::DRIFT:KMNO
+            qty_drift = 1 * init_drift_amt
+            qty_kmno = ratio * qty_drift
+            capital = qty_drift * row.drift + qty_kmno * row.kmno
+            starting_capital = capital
             position = (
                 timestamp,
                 signal,
                 row.drift,
                 row.kmno,
-                qty_unit,
-                ratio * qty_unit,
+                qty_drift,
+                qty_kmno,
                 capital,
             )
             if VERBOSE:
@@ -99,16 +102,16 @@ def backtest(price_df, ratio, capital, rebalance_freq, VERBOSE=True):
                 f"{timestamp}\tCLOSE\ts={entry_signal}\tpnl=${total_pnl:.2f}\tcapital=${capital:.2f}"
             )
 
-        # open new position sized to current capital and fair-value basket
-        basket_price = row.drift + ratio * row.kmno
-        qty_unit = capital / basket_price
+        # open new position mantaining 1:10 ratio
+        qty_drift = capital / (row.drift + ratio * row.kmno)
+        qty_kmno = ratio * qty_drift
         position = (
             timestamp,
             signal,
             row.drift,
             row.kmno,
-            qty_unit,
-            ratio * qty_unit,
+            qty_drift,
+            qty_kmno,
             capital,
         )
 
@@ -150,7 +153,7 @@ def backtest(price_df, ratio, capital, rebalance_freq, VERBOSE=True):
                 f"{timestamp}\tCLOSE\ts={entry_signal}\tpnl=${total_pnl:.2f}\tcapital=${capital:.2f}\n"
             )
 
-    return pd.DataFrame(
+    trades_df = pd.DataFrame(
         trades,
         columns=[
             "entry_time",
@@ -163,10 +166,64 @@ def backtest(price_df, ratio, capital, rebalance_freq, VERBOSE=True):
         ],
     )
 
+    return trades_df, starting_capital
+
+
+def compute_stats(trades_df, initial_capital):
+    if trades_df.empty or initial_capital == 0:
+        return {
+            "net_usd": 0,
+            "final_pct": 0,
+            "sharpe": 0,
+            "min_drawdown": 0,
+            "win_rate": 0,
+            "trades_per_year": 0,
+            "avg_hold_hrs": 0,
+        }
+
+    # stats
+    net_usd = trades_df["total_pnl_usd"].sum()
+    final_pct = net_usd / initial_capital * 100
+
+    total_days = (
+        trades_df["exit_time"].max() - trades_df["entry_time"].min()
+    ).total_seconds() / 86400
+    trades_per_year = len(trades_df) / total_days * 365
+    returns = trades_df["pnl_pct"]
+
+    avg_hours = (
+        trades_df["exit_time"] - trades_df["entry_time"]
+    ).dt.total_seconds().mean() / 3600
+
+    # sharpe
+    rf_annual = 0.0406
+    rf_per_trade = rf_annual * (avg_hours / 8760)
+    excess_ret = returns - rf_per_trade
+    std = excess_ret.std()
+    sharpe = (excess_ret.mean() / std * np.sqrt(8760 / avg_hours)) if std > 1e-8 else 0
+
+    # equity curve and drawdown
+    equity = trades_df["total_pnl_usd"].cumsum() + initial_capital
+    drawdown = equity / equity.cummax() - 1
+    min_dd = drawdown.min() * 100
+
+    # win rate
+    win_rate = (returns > 0).mean() * 100
+
+    return {
+        "net_usd": net_usd,
+        "final_pct": final_pct,
+        "sharpe": sharpe,
+        "min_drawdown": min_dd,
+        "win_rate": win_rate,
+        "trades_per_year": trades_per_year,
+        "avg_hold_hrs": avg_hours,
+    }
+
 
 if __name__ == "__main__":
     ratio = 10  # target 1 DRIFT vs 10 KMNO in synthetic basket
-    initial_capital = 1 + ratio  # USD deployed = $1 + $10 = $11
+    init_drift_amt = 1
 
     price_df = prepare_df(
         "../data/price/drift_15m_90days.json",
@@ -178,49 +235,21 @@ if __name__ == "__main__":
 
     for update_freq in range(1, 97):  # 1 to 96 (15min to 24h)
         # verbose=true for logs
-        trades_df = backtest(
-            price_df, ratio, initial_capital, update_freq, VERBOSE=False
+        trades_df, initial_capital = backtest(
+            price_df, ratio, init_drift_amt, update_freq, VERBOSE=False
         )
-        # stats
-        net_usd = trades_df["total_pnl_usd"].sum()
-        final_pct = net_usd / initial_capital * 100
-        total_days = (price_df.index[-1] - price_df.index[0]).total_seconds() / 86400
-        trades_per_year = len(trades_df) / total_days * 365
-        returns = trades_df["pnl_pct"]
 
-        if len(returns) > 0:
-            # sharpe based on per-trade returns
-            avg_hours = (
-                trades_df["exit_time"] - trades_df["entry_time"]
-            ).dt.total_seconds().mean() / 3600
-            rf_annual = 0.0406
-            rf_per_trade = rf_annual * (avg_hours / 8760)
-            excess_ret = returns - rf_per_trade
-            std = excess_ret.std()
-            sharpe = (
-                (excess_ret.mean() / std * np.sqrt(8760 / avg_hours))
-                if std > 1e-8
-                else 0
-            )
-            # equity curve and drawdown
-            equity = trades_df["total_pnl_usd"].cumsum() + initial_capital
-            drawdown = equity / equity.cummax() - 1
-            min_dd = drawdown.min() * 100
-            # win rate
-            win_rate = (returns > 0).mean() * 100
-        else:
-            sharpe = min_dd = win_rate = avg_hours = 0
-
+        stats = compute_stats(trades_df, initial_capital)
         results.append(
             (
                 update_freq,
-                net_usd,
-                final_pct,
-                sharpe,
-                min_dd,
-                win_rate,
-                trades_per_year,
-                avg_hours,
+                stats["net_usd"],
+                stats["final_pct"],
+                stats["sharpe"],
+                stats["min_drawdown"],
+                stats["win_rate"],
+                stats["trades_per_year"],
+                stats["avg_hold_hrs"],
             )
         )
 
@@ -238,7 +267,7 @@ if __name__ == "__main__":
         ],
     )
 
-    # df_results.to_csv("backtest_results.csv", index=False)
+    df_results.to_csv("backtest_results.csv", index=False)
 
     # fig = make_subplots(
     #     rows=3,
@@ -289,4 +318,5 @@ if __name__ == "__main__":
     #     xaxis3=dict(title="Update Frequency (bars)"),
     # )
 
-    # fig.write_image("backtest.png", width=1920, height=1080, scale=2)
+    # fig.show()
+    # fig.write_image("../plots/backtest.png", width=1920, height=1080, scale=2)
