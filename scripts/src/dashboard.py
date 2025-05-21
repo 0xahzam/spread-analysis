@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from backtest import prepare_df, backtest, compute_stats
+from backtest import prepare_df, backtest, compute_stats, run_sweep
 
 st.set_page_config(layout="wide")
 st.title("DRIFT/KMNO Convergence Arbitrage Dashboard")
@@ -98,14 +98,7 @@ if not trades_df.empty:
 # SECTION: Metric Trends
 st.markdown("## Metric Trends by Rebalance Frequency")
 
-results = []
-for f in range(1, 97):
-    tdf, cap = backtest(price_df, ratio, init_drift_amt, f, VERBOSE=False)
-    s = compute_stats(tdf, cap)
-    s["update_freq"] = f
-    results.append(s)
-
-df_results = pd.DataFrame(results).set_index("update_freq")
+df_results = run_sweep(price_df, ratio, init_drift_amt).set_index("update_freq")
 
 metric_groups = [
     ("net_usd", "Net PnL ($)", "$", "#636EFA"),
