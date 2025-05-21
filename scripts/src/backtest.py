@@ -1,12 +1,37 @@
 import json
-from pathlib import Path
-from typing import Tuple, List
-
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from typing import NamedTuple, Optional, Tuple
+from joblib import Parallel, delayed
 
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
+
+class Position(NamedTuple):
+    signal: int
+    px_drift: float
+    px_kmno: float
+    qty_drift: float
+    qty_kmno: float
+    capital_net: float
+    fee_open: float
+    fidx_drift: float
+    fidx_kmno: float
+
+
+class MTM(NamedTuple):
+    pnl_drift: float
+    pnl_kmno: float
+    funding_drift: float
+    funding_kmno: float
+    equity: float
+
+
+FEE_RATE = 0.001  # 10 bps taker
+
+
+# open/close fees
+def fee(qty: float, price: float) -> float:
+    return abs(qty) * price * FEE_RATE
 
 
 # read JSON file of OHLCV ‘candles’, parse timestamps and remove duplicates
@@ -18,11 +43,9 @@ def load_candles(path: str | Path) -> pd.Series:
     return df.drop_duplicates("start").set_index("start")["oracleClose"].astype(float)
 
 
-# Return cumulative funding index as float (quote-per-contract)
+# load cumulative funding index (float, quote-per-contract)
 def load_funding(path: str | Path) -> pd.Series:
-    # https://github.com/drift-labs/protocol-v2/blob/9aecb14bebc32fe448b614dc048e7b909708bee4/programs/drift/src/math/constants.rs#L99
     FUND_PREC = 1_000_000_000
-
     with open(path) as f:
         d = json.load(f)
     df = pd.DataFrame(d["fundingRates"])
@@ -33,314 +56,228 @@ def load_funding(path: str | Path) -> pd.Series:
     return df[["long", "short"]]
 
 
-def attach_funding(
-    px: pd.DataFrame, drift_f: pd.DataFrame, kmno_f: pd.DataFrame
-) -> pd.DataFrame:
-    out = px.copy()
-    out["fidx_drift_long"] = drift_f["long"].reindex(out.index, method="ffill")
-    out["fidx_drift_short"] = drift_f["short"].reindex(out.index, method="ffill")
-    out["fidx_kmno_long"] = kmno_f["long"].reindex(out.index, method="ffill")
-    out["fidx_kmno_short"] = kmno_f["short"].reindex(out.index, method="ffill")
-    return out.fillna(
-        {
-            "fidx_drift_long": 0.0,
-            "fidx_drift_short": 0.0,
-            "fidx_kmno_long": 0.0,
-            "fidx_kmno_short": 0.0,
-        }
-    )
-
-
 # load DRIFT and KMNO oracle‐price series, compute spread, signal, and shift to avoid lookahead
 # spread = drift_price − ratio*kmno_price; positive → DRIFT rich, negative → DRIFT cheap
 # signal = +1 to long DRIFT / short KMNO when spread < 0
 # signal = −1 to short DRIFT / long KMNO when spread > 0
 # use yesterday’s signal for trading (last tick/bar)
-def prepare_df(
-    drift_path: str | Path, kmno_path: str | Path, ratio: float
-) -> pd.DataFrame:
+def prepare_df(drift_path: str, kmno_path: str, ratio: float) -> pd.DataFrame:
     drift = load_candles(drift_path)
     kmno = load_candles(kmno_path)
+    df = pd.concat([drift, kmno], axis=1, keys=["drift", "kmno"]).dropna()
+    df["spread"] = df["drift"] - ratio * df["kmno"]
+    df["signal"] = -np.sign(df["spread"])
+    df["signal_yest"] = df["signal"].shift(1)
 
-    price_df = pd.concat([drift, kmno], axis=1, keys=["drift", "kmno"]).dropna()
-    price_df["spread"] = price_df["drift"] - ratio * price_df["kmno"]
-    price_df["signal"] = -np.sign(price_df["spread"])
-    price_df["signal_yest"] = price_df["signal"].shift(1)
+    f_drift = load_funding("../data/funding/drift-perp.json")
+    f_kmno = load_funding("../data/funding/kmno-perp.json")
 
-    drift_f = load_funding("../data/funding/drift-perp.json")
-    kmno_f = load_funding("../data/funding/kmno-perp.json")
-    price_df = attach_funding(price_df, drift_f, kmno_f)
+    df["fidx_drift_long"] = f_drift["long"].reindex(df.index, method="ffill").fillna(0)
+    df["fidx_drift_short"] = (
+        f_drift["short"].reindex(df.index, method="ffill").fillna(0)
+    )
+    df["fidx_kmno_long"] = f_kmno["long"].reindex(df.index, method="ffill").fillna(0)
+    df["fidx_kmno_short"] = f_kmno["short"].reindex(df.index, method="ffill").fillna(0)
 
-    return price_df.dropna(subset=["signal_yest"])
-
-
-# USD fee for one fill on one leg
-def fee(qty: float, price: float, rate: float = 0.001) -> float:
-    FEE_RATE = 0.001  # 10 bps taker fee
-    return abs(qty) * price * FEE_RATE
+    return df.dropna(subset=["signal_yest"])
 
 
-def _open_position(
-    ts: pd.Timestamp,
-    signal: int,
-    row: pd.Series,
-    qty_drift: float,
-    qty_kmno: float,
-) -> Tuple:
-    capital = qty_drift * row.drift + qty_kmno * row.kmno
-    open_fee = fee(qty_drift, row.drift) + fee(qty_kmno, row.kmno)
-
-    fidx_d = row["fidx_drift_long"] if signal > 0 else row["fidx_drift_short"]
-    fidx_k = row["fidx_kmno_short"] if signal > 0 else row["fidx_kmno_long"]
-
-    return (
-        ts,
-        signal,
-        row.drift,
-        row.kmno,
-        qty_drift,
-        qty_kmno,
-        capital - open_fee,
-        open_fee,
-        fidx_d,
-        fidx_k,
+# mark-to-market PnL, funding, equity
+def open_position(sig: int, row: pd.Series, capital: float, ratio: float) -> Position:
+    qd = capital / (row.drift + ratio * row.kmno)
+    qk = ratio * qd
+    fee_open = dual_fee(qd, row.drift, qk, row.kmno)
+    f_d = row.fidx_drift_long if sig > 0 else row.fidx_drift_short
+    f_k = row.fidx_kmno_short if sig > 0 else row.fidx_kmno_long
+    return Position(
+        sig, row.drift, row.kmno, qd, qk, capital - fee_open, fee_open, f_d, f_k
     )
 
 
-# backtest loop using tuple state and clear prints
-# skip flat signal, open initial position, flip on signal change, compute PnL, and final close
-def backtest(
-    price_df: pd.DataFrame,
-    ratio: float,
-    init_drift_amt: float,
-    rebalance_freq: int,
-    VERBOSE: bool = True,
-) -> Tuple[pd.DataFrame, float]:
-    position = None
-    starting_capital = 0
-    trades: List[Tuple] = []
-
-    for i in range(0, len(price_df), rebalance_freq):
-        row = price_df.iloc[i]
-
-        # timestamp, signal
-        timestamp, signal = row.name, int(row.signal_yest)
-
-        if signal == 0:  # skip flat signal (no position)
-            continue
-
-        if position is None:  # open first position: 1:10::DRIFT:KMNO
-            qty_drift = init_drift_amt
-            qty_kmno = ratio * qty_drift
-            position = _open_position(timestamp, signal, row, qty_drift, qty_kmno)
-            starting_capital = position[6]
-            if VERBOSE:
-                print(f"{timestamp}\tOPEN\ts={signal}\t\t\tcapital=${position[6]:.2f}")
-            continue
-
-        (
-            entry_time,
-            entry_signal,
-            entry_drift,
-            entry_kmno,
-            qty_drift,
-            qty_kmno,
-            capital_at_entry,
-            entry_fee,
-            fidx_d_entry,
-            fidx_k_entry,
-        ) = position
-
-        if signal == entry_signal:  # if signal unchanged, hold current position
-            continue
-
-        # on signal flip: close existing position and compute PnL
-        # signal * quantity * (current price - open price)
-        drift_pnl = entry_signal * qty_drift * (row.drift - entry_drift)
-        kmno_pnl = -entry_signal * qty_kmno * (row.kmno - entry_kmno)
-        close_fee = fee(qty_drift, row.drift) + fee(qty_kmno, row.kmno)
-
-        fidx_d_exit = (
-            row["fidx_drift_long"] if entry_signal > 0 else row["fidx_drift_short"]
-        )
-        fidx_k_exit = (
-            row["fidx_kmno_short"] if entry_signal > 0 else row["fidx_kmno_long"]
-        )
-
-        funding_d = -entry_signal * qty_drift * (fidx_d_exit - fidx_d_entry)
-        funding_k = entry_signal * qty_kmno * (fidx_k_exit - fidx_k_entry)
-
-        total_pnl = drift_pnl + kmno_pnl + funding_d + funding_k - entry_fee - close_fee
-        capital = capital_at_entry + total_pnl
-
-        trades.append(
-            (
-                entry_time,
-                timestamp,
-                entry_signal,
-                drift_pnl,
-                kmno_pnl,
-                total_pnl,
-                total_pnl / capital_at_entry,
-            )
-        )
-
-        if VERBOSE:
-            print(
-                f"{timestamp}\tCLOSE\ts={entry_signal}\tpnl=${total_pnl:.2f}\tcapital=${capital:.2f}"
-            )
-
-        # open new position mantaining 1:10 ratio
-        qty_drift = capital / (row.drift + ratio * row.kmno)
-        qty_kmno = ratio * qty_drift
-        position = _open_position(timestamp, signal, row, qty_drift, qty_kmno)
-        if VERBOSE:
-            print(f"{timestamp}\tOPEN\ts={signal}\t\t\tcapital=${position[6]:.2f}")
-
-    if position:  # force final close at end of data if still in position
-        (
-            entry_time,
-            entry_signal,
-            entry_drift,
-            entry_kmno,
-            qty_drift,
-            qty_kmno,
-            capital_at_entry,
-            entry_fee,
-            fidx_d_entry,
-            fidx_k_entry,
-        ) = position
-        row = price_df.iloc[-1]
-        timestamp = row.name
-
-        drift_pnl = entry_signal * qty_drift * (row.drift - entry_drift)
-        kmno_pnl = -entry_signal * qty_kmno * (row.kmno - entry_kmno)
-
-        close_fee = fee(qty_drift, row.drift) + fee(qty_kmno, row.kmno)
-
-        fidx_d_exit = (
-            row["fidx_drift_long"] if entry_signal > 0 else row["fidx_drift_short"]
-        )
-        fidx_k_exit = (
-            row["fidx_kmno_short"] if entry_signal > 0 else row["fidx_kmno_long"]
-        )
-
-        funding_d = -entry_signal * qty_drift * (fidx_d_exit - fidx_d_entry)
-        funding_k = entry_signal * qty_kmno * (fidx_k_exit - fidx_k_entry)
-
-        total_pnl = drift_pnl + kmno_pnl + funding_d + funding_k - entry_fee - close_fee
-        capital = capital_at_entry + total_pnl
-
-        trades.append(
-            (
-                entry_time,
-                timestamp,
-                entry_signal,
-                drift_pnl,
-                kmno_pnl,
-                total_pnl,
-                total_pnl / capital_at_entry,
-            )
-        )
-
-        if VERBOSE:
-            print(
-                f"{timestamp}\tCLOSE\ts={entry_signal}\tpnl=${total_pnl:.2f}\tcapital=${capital:.2f}\n"
-            )
-
-    trades_df = pd.DataFrame(
-        trades,
-        columns=[
-            "entry_time",
-            "exit_time",
-            "signal",
-            "drift_pnl_usd",
-            "kmno_pnl_usd",
-            "total_pnl_usd",
-            "pnl_pct",
-        ],
-    )
-
-    return trades_df, starting_capital
+def mark_to_market(pos: Position, row: pd.Series) -> MTM:
+    pnl_d = pos.signal * pos.qty_drift * (row.drift - pos.px_drift)
+    pnl_k = -pos.signal * pos.qty_kmno * (row.kmno - pos.px_kmno)
+    fidx_d1 = row.fidx_drift_long if pos.signal > 0 else row.fidx_drift_short
+    fidx_k1 = row.fidx_kmno_short if pos.signal > 0 else row.fidx_kmno_long
+    funding_d = -pos.signal * pos.qty_drift * (fidx_d1 - pos.fidx_drift)
+    funding_k = pos.signal * pos.qty_kmno * (fidx_k1 - pos.fidx_kmno)
+    equity = pos.capital_net + pnl_d + pnl_k + funding_d + funding_k
+    return MTM(pnl_d, pnl_k, funding_d, funding_k, equity)
 
 
-def compute_stats(trades_df: pd.DataFrame, initial_capital: float) -> dict:
-    if trades_df.empty or initial_capital == 0:
-        return {
-            "net_usd": 0,
-            "final_pct": 0,
-            "sharpe": 0,
-            "min_drawdown": 0,
-            "win_rate": 0,
-            "trades_per_year": 0,
-            "avg_hold_hrs": 0,
-        }
+def dual_fee(qd, pd, qk, pk):
+    return (abs(qd) * pd + abs(qk) * pk) * FEE_RATE
 
-    # stats
-    net_usd = trades_df["total_pnl_usd"].sum()
-    final_pct = net_usd / initial_capital * 100
 
-    total_days = (
-        trades_df["exit_time"].max() - trades_df["entry_time"].min()
-    ).total_seconds() / 86400
-    trades_per_year = len(trades_df) / total_days * 365
-    returns = trades_df["pnl_pct"]
-
-    avg_hours = (
-        trades_df["exit_time"] - trades_df["entry_time"]
-    ).dt.total_seconds().mean() / 3600
-
-    # sharpe
-    rf_annual = 0.0406
-    rf_per_trade = rf_annual * (avg_hours / 8760)
-    excess_ret = returns - rf_per_trade
-    std = excess_ret.std()
-    sharpe = (excess_ret.mean() / std * np.sqrt(8760 / avg_hours)) if std > 1e-8 else 0
-
-    # equity curve and drawdown
-    equity = trades_df["total_pnl_usd"].cumsum() + initial_capital
-    drawdown = equity / equity.cummax() - 1
-    min_dd = drawdown.min() * 100
-
-    # win rate
-    win_rate = (returns > 0).mean() * 100
-
+def make_snap(ts, signal, drift_px, kmno_px):
     return {
-        "net_usd": net_usd,
-        "final_pct": final_pct,
-        "sharpe": sharpe,
-        "min_drawdown": min_dd,
-        "win_rate": win_rate,
-        "trades_per_year": trades_per_year,
-        "avg_hold_hrs": avg_hours,
+        "ts": ts,
+        "drift_px": drift_px,
+        "kmno_px": kmno_px,
+        "signal": signal,
+        "is_entry": False,
+        "is_exit": False,
+        "qty_drift": 0.0,
+        "qty_kmno": 0.0,
+        "pnl_drift": 0.0,
+        "pnl_kmno": 0.0,
+        "funding_drift": 0.0,
+        "funding_kmno": 0.0,
+        "fee": 0.0,
+        "equity": np.nan,
     }
 
 
-# run backtest for all update frequencies for eg. between 15m and 24h
-def run_sweep(
-    price_df: pd.DataFrame,
-    ratio: float,
-    init_drift_amt: float,
-    max_freq: int = 96,
-) -> pd.DataFrame:
-    results = []
-    for freq in range(1, max_freq + 1):
-        trades_df, capital_0 = backtest(
-            price_df, ratio, init_drift_amt, freq, VERBOSE=False
+def backtest(
+    df: pd.DataFrame, ratio: float, init_qty: float, rebalance_freq: int
+) -> Tuple[pd.DataFrame, float]:
+    timeline = []
+    position: Optional[Position] = None
+    capital_0 = 0
+
+    rebalance_mask = pd.Series(False, index=df.index)
+    rebalance_mask.iloc[::rebalance_freq] = True
+
+    for i, row in enumerate(df.itertuples(index=True)):
+        ts = row.Index
+        drift_px = row.drift
+        kmno_px = row.kmno
+        rebalance_now = rebalance_mask.iloc[i]
+        signal = int(row.signal_yest)  # +1, −1, or 0
+        snap = make_snap(ts, signal, drift_px, kmno_px)
+
+        # mark existing position
+        if position is not None:
+            mtm = mark_to_market(position, row)
+            equity_now = mtm.equity
+
+            snap["qty_drift"] = position.qty_drift
+            snap["qty_kmno"] = position.qty_kmno
+            snap["pnl_drift"] = mtm.pnl_drift
+            snap["pnl_kmno"] = mtm.pnl_kmno
+            snap["funding_drift"] = mtm.funding_drift
+            snap["funding_kmno"] = mtm.funding_kmno
+            snap["equity"] = equity_now
+
+            if rebalance_now and signal != position.signal:  # close old leg
+                fee_close = dual_fee(
+                    position.qty_drift, row.drift, position.qty_kmno, row.kmno
+                )
+                cap_1 = equity_now - fee_close
+                snap["is_exit"] = True
+                snap["fee"] = fee_close
+                snap["equity"] = cap_1
+
+                if signal:  # open new leg immediately
+                    position = open_position(signal, row, cap_1, ratio)
+                    snap["is_entry"] = True
+                    snap["qty_drift"] = position.qty_drift
+                    snap["qty_kmno"] = position.qty_kmno
+                    snap["fee"] += position.fee_open
+                else:
+                    position = None
+
+        # no position, maybe open
+        elif signal and rebalance_now:
+            capital_0 = init_qty * row.drift + ratio * init_qty * row.kmno
+            position = open_position(signal, row, capital_0, ratio)
+            snap["is_entry"] = True
+            snap["qty_drift"] = position.qty_drift
+            snap["qty_kmno"] = position.qty_kmno
+            snap["fee"] = position.fee_open
+            snap["equity"] = position.capital_net
+
+        timeline.append(snap)
+
+    # final close
+    if position:
+        row = df.iloc[-1]
+        ts = row.name
+        drift_px = row.drift
+        kmno_px = row.kmno
+        mtm = mark_to_market(position, row)
+        fee_close = dual_fee(position.qty_drift, row.drift, position.qty_kmno, row.kmno)
+        cap_1 = mtm.equity - fee_close
+
+        timeline.append(
+            {
+                "ts": ts,
+                "drift_px": drift_px,
+                "kmno_px": kmno_px,
+                "signal": position.signal,
+                "is_entry": False,
+                "is_exit": True,
+                "qty_drift": position.qty_drift,
+                "qty_kmno": position.qty_kmno,
+                "pnl_drift": mtm.pnl_drift,
+                "pnl_kmno": mtm.pnl_kmno,
+                "funding_drift": mtm.funding_drift,
+                "funding_kmno": mtm.funding_kmno,
+                "fee": fee_close,
+                "equity": cap_1,
+            }
         )
-        stats = compute_stats(trades_df, capital_0)
-        results.append(
-            (
-                freq,
-                stats["net_usd"],
-                stats["final_pct"],
-                stats["sharpe"],
-                stats["min_drawdown"],
-                stats["win_rate"],
-                stats["trades_per_year"],
-                stats["avg_hold_hrs"],
-            )
+
+    return pd.DataFrame(timeline).set_index("ts"), capital_0
+
+
+def compute_stats(timeline: pd.DataFrame, capital_0: float) -> dict:
+    if capital_0 == 0 or timeline.empty:
+        return {
+            k: 0
+            for k in [
+                "net_usd",
+                "final_pct",
+                "sharpe",
+                "min_drawdown",
+                "win_rate",
+                "trades_per_year",
+                "avg_hold_hrs",
+            ]
+        }
+
+    equity = timeline["equity"].ffill().dropna()
+    duration = (timeline.index[-1] - timeline.index[0]).total_seconds() / 86400
+
+    trades = timeline[timeline.is_exit]
+    trade_returns = trades["equity"].diff().dropna()
+    hold_durations = trades.index.to_series().diff().dt.total_seconds().dropna() / 3600
+
+    rf_ann = 0.0406
+    avg_hold = hold_durations.mean() if not hold_durations.empty else 1
+    rf_trade = rf_ann * (avg_hold / 8760)
+    excess = trade_returns / capital_0 - rf_trade
+    std = excess.std()
+
+    return {
+        "net_usd": equity.iloc[-1] - capital_0,
+        "final_pct": (equity.iloc[-1] / capital_0 - 1) * 100,
+        "sharpe": (excess.mean() / std * np.sqrt(8760 / avg_hold)) if std > 1e-8 else 0,
+        "min_drawdown": 100 * (equity / equity.cummax() - 1).min(),
+        "win_rate": 100 * (trade_returns > 0).mean(),
+        "trades_per_year": len(trade_returns) / duration * 365,
+        "avg_hold_hrs": avg_hold,
+    }
+
+
+def sweep_freq(price_df, ratio, init_drift_amt, max_freq=96, n_jobs=-1):
+    def run(freq):
+        timeline, capital_0 = backtest(price_df, ratio, init_drift_amt, freq)
+        stats = compute_stats(timeline, capital_0)
+        return (
+            freq,
+            stats["net_usd"],
+            stats["final_pct"],
+            stats["sharpe"],
+            stats["min_drawdown"],
+            stats["win_rate"],
+            stats["trades_per_year"],
+            stats["avg_hold_hrs"],
         )
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(run)(freq) for freq in range(1, max_freq + 1)
+    )
     return pd.DataFrame(
         results,
         columns=[
@@ -357,66 +294,15 @@ def run_sweep(
 
 
 if __name__ == "__main__":
-    ratio = 10  # target 1 DRIFT vs 10 KMNO in synthetic basket
-    init_drift_amt = 1
+    ratio = 10
+    init_qty = 1
+    max_freq = 96
 
-    price_df = prepare_df(
+    df = prepare_df(
         "../data/price/drift_15m_90days.json",
         "../data/price/kmno_15m_90days.json",
         ratio,
     )
 
-    # df_results = run_sweep(price_df, ratio, init_drift_amt)
-    # df_results.to_csv("backtest_results.csv", index=False)
-
-    # fig = make_subplots(
-    #     rows=3,
-    #     cols=1,
-    #     shared_xaxes=True,
-    #     vertical_spacing=0.05,
-    #     subplot_titles=["PnL (%)", "Sharpe Ratio", "Min Drawdown (%)"],
-    # )
-
-    # fig.add_trace(
-    #     go.Scatter(
-    #         x=df_results["update_freq"],
-    #         y=df_results["final_pct"],
-    #         mode="lines+markers",
-    #         name="PnL %",
-    #     ),
-    #     row=1,
-    #     col=1,
-    # )
-
-    # fig.add_trace(
-    #     go.Scatter(
-    #         x=df_results["update_freq"],
-    #         y=df_results["sharpe"],
-    #         mode="lines+markers",
-    #         name="Sharpe Ratio",
-    #     ),
-    #     row=2,
-    #     col=1,
-    # )
-
-    # fig.add_trace(
-    #     go.Scatter(
-    #         x=df_results["update_freq"],
-    #         y=df_results["min_drawdown"],
-    #         mode="lines+markers",
-    #         name="Min Drawdown",
-    #     ),
-    #     row=3,
-    #     col=1,
-    # )
-
-    # fig.update_layout(
-    #     height=1200,
-    #     title_text="Strategy Metrics by Update Frequency",
-    #     template="plotly_white",
-    #     showlegend=False,
-    #     xaxis3=dict(title="Update Frequency (bars)"),
-    # )
-
-    # fig.show()
-    # fig.write_image("../plots/backtest.png", width=1920, height=1080, scale=2)
+    sweep_results = sweep_freq(df, ratio, init_qty, max_freq)
+    sweep_results.to_csv("backtest_results.csv", index=False)

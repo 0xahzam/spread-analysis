@@ -1,0 +1,17 @@
+{
+  "name": "bot",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@drift-labs/sdk": "^2.121.0-beta.25",
+    "@solana/web3.js": "^1.98.2",
+    "winston": "^3.17.0"
+  }
+}
