@@ -293,6 +293,10 @@ def sweep_freq(price_df, ratio, init_drift_amt, max_freq=96, n_jobs=-1):
     )
 
 
+def load_sweep(path: str | Path = "backtest_results.csv") -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
 if __name__ == "__main__":
     ratio = 10
     init_qty = 1

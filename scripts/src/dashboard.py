@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from backtest import prepare_df, backtest, compute_stats, sweep_freq
+from backtest import load_sweep, prepare_df, backtest, compute_stats, sweep_freq
 
 st.set_page_config(layout="wide")
 st.title("DRIFT/KMNO Convergence Arbitrage Dashboard")
@@ -107,7 +107,7 @@ st.dataframe(trade_log[cols], use_container_width=True, height=400)
 
 st.markdown("## Metric Trends by Rebalance Frequency")
 
-df_results = sweep_freq(price_df, ratio, init_drift_amt).set_index("update_freq")
+df_results = load_sweep()
 
 metric_groups = [
     ("net_usd", "Net PnL ($)", "$", "#636EFA"),
