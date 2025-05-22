@@ -1,31 +1,23 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from backtest import load_sweep, prepare_df, backtest, compute_stats, sweep_freq
+from backtest import load_sweep, prepare_df, backtest, compute_stats
 
 st.set_page_config(layout="wide")
 st.title("DRIFT/KMNO Convergence Arbitrage Dashboard")
 
 st.markdown("""
-Pool: DRIFT/USD and KMNO/USD PERPS  
-Data: Oracle prices (15m candles, 90 days)
-""")
-
-st.markdown("""
-## Strategy Logic
-
-This strategy trades DRIFT vs KMNO based on spread mean reversion.  
-We fix the unit ratio at **1 DRIFT : 10 KMNO** and rebalance positions when the spread flips sign.
-
-- Long DRIFT / Short KMNO when DRIFT is underpriced (`spread < 0`)  
-- Short DRIFT / Long KMNO when DRIFT is overpriced (`spread > 0`)
-
-Trades execute on signal flips using prior-bar signals to avoid lookahead. Position sizing is dynamic and based on capital and prices at each trade.
+### Strategy Overview
+- **Markets:** DRIFT/USD, KMNO/USD (Perpetuals)
+- **Data:** 15m oracle prices (90 days)
+- **Ratio Fixed:** 1 DRIFT : 10 KMNO
+- **Signal:** Spread = DRIFT - 10 * KMNO (flip triggers trade)
+- **Execution:** Taker orders on signal flip (lagged by 1 bar)
+- **Fees:** 10 bps taker per leg
 """)
 
 ratio = 10
 init_drift_amt = 1
-
 price_df = prepare_df(
     "../data/price/drift_15m_90days.json",
     "../data/price/kmno_15m_90days.json",
@@ -33,63 +25,109 @@ price_df = prepare_df(
 )
 
 freq = st.slider("Rebalance Frequency (bars)", 1, 96, 4)
-
 timeline_df, initial_capital = backtest(price_df, ratio, init_drift_amt, freq)
 stats = compute_stats(timeline_df, initial_capital)
 
-st.markdown(f"""
-## Backtest Summary
+equity = timeline_df["equity"].ffill()
+cum_pnl = equity - initial_capital
 
-- Rebalance frequency: **{freq} bars** = **{freq * 15} minutes**  
-- Starting notional: **1 DRIFT, 10 KMNO**  
-- Sizing, capital, and equity updated per trade.
+st.markdown("### Backtest Summary")
+st.markdown(f"""
+- **Rebalance every:** {freq} bars ({freq * 15} min)  
+- **Initial Notional:** 1 DRIFT, 10 KMNO  
+- **Initial Capital (USD):** {initial_capital:.2f}
 """)
 
 metrics_df = pd.DataFrame(stats.items(), columns=["Metric", "Value"])
 metrics_df["Value"] = metrics_df["Value"].map("{:.2f}".format)
 st.dataframe(metrics_df, use_container_width=True)
 
-if not timeline_df.empty:
-    st.markdown("## Capital Growth & Realized PnL")
+st.markdown("---")
+st.markdown("### Equity Curve & Volatility")
 
-    equity = timeline_df["equity"].ffill()
-    cum_pnl = equity - initial_capital
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(x=timeline_df.index, y=equity, name="Equity", line=dict(color="#1f77b4"))
+)
+fig.add_trace(
+    go.Scatter(
+        x=timeline_df.index,
+        y=cum_pnl,
+        name="Cumulative PnL",
+        line=dict(color="#EF553B", dash="dash"),
+    )
+)
+fig.update_layout(
+    height=400, margin=dict(t=20, b=20), xaxis_title="Time", yaxis_title="USD"
+)
+st.plotly_chart(fig, use_container_width=True)
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=timeline_df.index,
-            y=equity,
-            mode="lines",
-            line=dict(color="#1f77b4"),
-            name="Equity",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=timeline_df.index,
-            y=cum_pnl,
-            mode="lines",
-            line=dict(color="#EF553B", dash="dash"),
-            name="Cumulative PnL",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=[timeline_df.index[0], timeline_df.index[-1]],
-            y=[initial_capital, initial_capital],
-            mode="lines",
-            line=dict(color="gray", dash="dot"),
-            name="Starting Capital",
-        )
-    )
-    fig.update_layout(
-        height=400, margin=dict(t=20, b=20), xaxis_title="Time", yaxis_title="USD"
-    )
-    st.plotly_chart(fig, use_container_width=True)
+pct_change = equity.pct_change().fillna(0)
+vol_rolling = pct_change.rolling(30).std()
 
+fig_vol = go.Figure()
+fig_vol.add_trace(
+    go.Scatter(
+        x=timeline_df.index,
+        y=100 * pct_change,
+        name="% Change",
+        line=dict(color="#FFA15A"),
+    )
+)
+fig_vol.add_trace(
+    go.Scatter(
+        x=timeline_df.index,
+        y=100 * vol_rolling,
+        name="30-Bar Rolling Vol",
+        line=dict(color="#FF6692", dash="dot"),
+    )
+)
+fig_vol.update_layout(
+    height=300, xaxis_title="Time", yaxis_title="Volatility (%)", yaxis_tickformat=".2f"
+)
+st.plotly_chart(fig_vol, use_container_width=True)
 
-st.markdown("## Trade Log")
+st.markdown("---")
+st.markdown("### Prices & Spread")
+
+df = price_df.loc[timeline_df.index].copy()
+df["kmno_scaled"] = df["kmno"] * ratio
+spread_vol = df["spread"].pct_change().fillna(0) * 100
+
+fig_price = go.Figure()
+fig_price.add_trace(
+    go.Scatter(x=df.index, y=df["drift"], name="DRIFT", line=dict(color="#1f77b4"))
+)
+fig_price.add_trace(
+    go.Scatter(
+        x=df.index, y=df["kmno"], name="KMNO", line=dict(color="#00cc96", dash="dot")
+    )
+)
+fig_price.update_layout(height=300, margin=dict(t=20), yaxis_title="USD")
+st.plotly_chart(fig_price, use_container_width=True)
+
+fig_spread = go.Figure()
+fig_spread.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=df["spread"],
+        name="Spread (DRIFT − 10×KMNO)",
+        line=dict(color="#EF553B"),
+    )
+)
+fig_spread.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=spread_vol,
+        name="Spread Volatility",
+        line=dict(color="#AB63FA", dash="dot"),
+    )
+)
+fig_spread.update_layout(height=300, margin=dict(t=20), yaxis_title="USD / %")
+st.plotly_chart(fig_spread, use_container_width=True)
+
+st.markdown("---")
+st.markdown("### Trade Log & Distribution")
 
 trade_log = timeline_df[timeline_df["is_exit"] | timeline_df["is_entry"]].copy()
 cols = [
@@ -105,10 +143,19 @@ cols = [
 ]
 st.dataframe(trade_log[cols], use_container_width=True, height=400)
 
-st.markdown("## Metric Trends by Rebalance Frequency")
+summary = (
+    trade_log["signal"]
+    .value_counts()
+    .rename({1: "Long DRIFT", -1: "Short DRIFT"})
+    .to_frame("Count")
+)
+st.markdown("**Trade Direction Distribution**")
+st.dataframe(summary, use_container_width=True)
+
+st.markdown("---")
+st.markdown("### Performance by Rebalance Frequency")
 
 df_results = load_sweep()
-
 metric_groups = [
     ("net_usd", "Net PnL ($)", "$", "#636EFA"),
     ("final_pct", "Final Return (%)", "%", "#EF553B"),
@@ -124,18 +171,23 @@ for i in range(0, len(metric_groups), 2):
     for j, (key, title, unit, color) in enumerate(metric_groups[i : i + 2]):
         fig = go.Figure(
             go.Scatter(
-                x=df_results.index,
+                x=df_results["update_freq"],
                 y=df_results[key],
                 mode="lines+markers",
                 line=dict(color=color),
-                name=key,
             )
         )
         fig.update_layout(
             height=300,
-            margin=dict(t=30, b=30),
             title=title,
             xaxis_title="Rebalance Frequency (bars)",
             yaxis_title=unit,
         )
         [col1, col2][j].plotly_chart(fig, use_container_width=True)
+
+st.markdown("""
+---
+**Backtest Engine:** Custom Python  
+**Oracle Feed:** Drift oracle (via JSON dumps)  
+**Data Range:** Last 90 days, 15m interval  
+""")
