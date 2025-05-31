@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from backtest import load_sweep, prepare_df, backtest, compute_stats
+from reproduce import load_sweep, prepare_df, backtest, compute_stats
 
 st.set_page_config(layout="wide")
 st.title("DRIFT/KMNO Convergence Arbitrage Dashboard")
