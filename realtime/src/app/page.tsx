@@ -85,6 +85,8 @@ const useMarketData = (priceRatio: number, zWindow: number, updateInterval: numb
         }
       }
 
+      // Sort by timestamp to ensure proper order
+      alignedData.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
       setData(alignedData.slice(-200));
       setLoading(false);
     } catch (err) {
@@ -108,12 +110,7 @@ const formatChange = (current: number, previous: number) => {
   return `${change.startsWith("-") ? "" : "+"}${change}%`;
 };
 
-const formatTime = (date: Date) =>
-  date.toLocaleTimeString("en-US", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+const formatTime = (date: Date) => date.toISOString().substring(11, 16); // Extract HH:MM from ISO string (UTC)
 
 // Components
 const StatusCard = ({
@@ -386,16 +383,7 @@ const DriftKmnoDashboard = () => {
 
         <div className="text-center">
           <p className="text-xs text-gray-400">
-            Updated:{" "}
-            {latest?.timestamp.toLocaleString("en-US", {
-              year: "numeric",
-              month: "short",
-              day: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-              second: "2-digit",
-              hour12: false,
-            }) ?? "N/A"}
+            Updated: {latest ? latest.timestamp.toISOString().replace("T", " ").substring(0, 19) + " UTC" : "N/A"}
           </p>
         </div>
       </div>
