@@ -364,7 +364,7 @@ const DriftKmnoDashboard = () => {
               dataKey="zScore"
               stroke="#10b981"
               strokeWidth={1.5}
-              dot={(props: any) => {
+              dot={(props: { cx: number; cy: number; payload: { zScore: number; signal: number } }) => {
                 const { cx, cy, payload } = props;
                 if (Math.abs(payload.zScore) > 2 && payload.signal !== 0) {
                   return (
