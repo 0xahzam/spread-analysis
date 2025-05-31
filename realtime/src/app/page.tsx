@@ -193,8 +193,9 @@ const DriftKmnoDashboard = () => {
         ...d,
         time: formatTime(d.timestamp),
         timestamp: d.timestamp.getTime(),
+        kmnoScaled: d.kmno * config.priceRatio, // Scale KMNO for secondary axis
       })),
-    [data],
+    [data, config.priceRatio],
   );
 
   const [latest, previous] = [data[data.length - 1], data[data.length - 2]];
@@ -238,8 +239,8 @@ const DriftKmnoDashboard = () => {
 
   return (
     <div className="min-h-screen bg-white">
-      <div className="max-w-7xl mx-auto p-6 space-y-8">
-        <div className="flex items-center justify-between">
+      <div className="max-w-7xl mx-auto p-4 sm:p-6 space-y-6 sm:space-y-8">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="space-y-1">
             <h1 className="text-lg font-semibold text-gray-900">DRIFT-KMNO Spread Feed</h1>
             <p className="text-xs text-gray-500">Real-time convergence-divergence trading signals</p>
@@ -250,7 +251,7 @@ const DriftKmnoDashboard = () => {
           </div>
         </div>
 
-        <div className="flex items-center gap-6 text-sm">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-6 text-sm">
           <div className="flex items-center gap-2">
             <span className="text-gray-600">Price Ratio:</span>
             <input
@@ -294,7 +295,7 @@ const DriftKmnoDashboard = () => {
           </button>
         </div>
 
-        <div className="grid grid-cols-5 gap-8">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 sm:gap-8">
           <StatusCard label="DRIFT Price" value={latest?.drift ?? 0} change={changes.drift} isLive />
           <StatusCard label="KMNO Price" value={latest?.kmno ?? 0} change={changes.kmno} isLive />
           <StatusCard label="Raw Spread" value={latest?.spread ?? 0} />
@@ -302,9 +303,9 @@ const DriftKmnoDashboard = () => {
           <StatusCard label="Current Signal" value="" signal={latest?.signal ?? 0} />
         </div>
 
-        <div className="grid grid-cols-2 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 sm:gap-8">
           <BaseChart title="Price Chart">
-            <LineChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+            <LineChart data={chartData} margin={{ top: 5, right: 30, left: 5, bottom: 5 }}>
               <CartesianGrid strokeDasharray="2 2" stroke="#f1f5f9" />
               <XAxis
                 dataKey="time"
@@ -314,10 +315,42 @@ const DriftKmnoDashboard = () => {
                 tickLine={false}
                 tick={{ fill: "#64748b" }}
               />
-              <YAxis stroke="#64748b" fontSize={10} axisLine={false} tickLine={false} tick={{ fill: "#64748b" }} />
+              <YAxis
+                yAxisId="left"
+                stroke="#64748b"
+                fontSize={10}
+                axisLine={false}
+                tickLine={false}
+                tick={{ fill: "#64748b" }}
+              />
+              <YAxis
+                yAxisId="right"
+                orientation="right"
+                stroke="#64748b"
+                fontSize={10}
+                axisLine={false}
+                tickLine={false}
+                tick={{ fill: "#64748b" }}
+              />
               <Tooltip contentStyle={CHART_STYLE} labelStyle={{ color: "#374151", fontSize: "11px" }} />
-              <Line type="monotone" dataKey="drift" stroke="#3b82f6" strokeWidth={1.5} dot={false} name="DRIFT" />
-              <Line type="monotone" dataKey="kmno" stroke="#ef4444" strokeWidth={1.5} dot={false} name="KMNO" />
+              <Line
+                yAxisId="left"
+                type="monotone"
+                dataKey="drift"
+                stroke="#3b82f6"
+                strokeWidth={1.5}
+                dot={false}
+                name="DRIFT"
+              />
+              <Line
+                yAxisId="right"
+                type="monotone"
+                dataKey="kmno"
+                stroke="#ef4444"
+                strokeWidth={1.5}
+                dot={false}
+                name="KMNO"
+              />
             </LineChart>
           </BaseChart>
 
@@ -340,7 +373,7 @@ const DriftKmnoDashboard = () => {
           </BaseChart>
         </div>
 
-        <BaseChart title="Z-Score with Trading Signals" height="h-80">
+        <BaseChart title="Z-Score with Trading Signals" height="h-64 sm:h-80">
           <LineChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
             <CartesianGrid strokeDasharray="2 2" stroke="#f1f5f9" />
             <XAxis
