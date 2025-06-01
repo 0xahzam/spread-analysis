@@ -9,6 +9,8 @@ import {
   BASE_PRECISION,
   QUOTE_PRECISION,
   BN,
+  FUNDING_RATE_PRECISION,
+  PRICE_PRECISION,
 } from "@drift-labs/sdk";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { connection, config } from "./config";
@@ -22,6 +24,10 @@ const SIGNAL_LAG_PERIODS = 2; // Signal lag periods
 const CYCLE_INTERVAL_MS = 900_000; // 15min cycle (900k ms)
 const SIMULATION_MODE = false; // Simulation mode flag
 const ENV = "mainnet-beta";
+
+// Slippage parameters
+const MAX_SLIPPAGE_BPS = 25; // 25 basis points = 0.25%
+const CLOSE_MAX_SLIPPAGE_BPS = 50; // Higher tolerance for exits
 
 // Retry configuration
 const MAX_RETRIES = 3;
@@ -80,7 +86,7 @@ const reconcilePositionState = async () => {
       const market = Array.from(marketMap.values()).find(m => m.marketIndex === pos.marketIndex);
       if (!market) continue;
 
-      const size = Number(pos.baseAssetAmount) / Number(BASE_PRECISION);
+      const size = pos.baseAssetAmount.toNumber() / BASE_PRECISION.toNumber();
 
       if (market.baseAssetSymbol === "DRIFT") {
         drift = size;
@@ -151,7 +157,7 @@ const logActualPositions = async () => {
       const market = Array.from(marketMap.values()).find(m => m.marketIndex === pos.marketIndex);
       if (!market) continue;
 
-      const size = Number(pos.baseAssetAmount) / Number(BASE_PRECISION);
+      const size = pos.baseAssetAmount.toNumber() / BASE_PRECISION.toNumber();
       const pnl = Number(driftClient.getUser().getUnrealizedPNL(false, pos.marketIndex)) / Number(QUOTE_PRECISION);
 
       if (market.baseAssetSymbol === "DRIFT") {
@@ -172,6 +178,51 @@ const logActualPositions = async () => {
   }
 };
 
+// Funding cost tracking
+const logFundingCosts = async () => {
+  if (SIMULATION_MODE || !currentPosition) return;
+
+  try {
+    const driftMarket = marketMap.get("DRIFT");
+    const kmnoMarket = marketMap.get("KMNO");
+
+    if (!driftMarket || !kmnoMarket) return;
+
+    const driftMarketAccount = driftClient.getPerpMarketAccount(driftMarket.marketIndex);
+    const kmnoMarketAccount = driftClient.getPerpMarketAccount(kmnoMarket.marketIndex);
+
+    if (!driftMarketAccount || !kmnoMarketAccount) return;
+
+    const driftOracleData = driftClient.getOracleDataForPerpMarket(driftMarket.marketIndex);
+    const kmnoOracleData = driftClient.getOracleDataForPerpMarket(kmnoMarket.marketIndex);
+
+    if (!driftOracleData?.price || !kmnoOracleData?.price) return;
+
+    // Get rates and prices
+    const driftDailyRate = Number(driftMarketAccount.amm.last24HAvgFundingRate) / Number(FUNDING_RATE_PRECISION);
+    const kmnoDailyRate = Number(kmnoMarketAccount.amm.last24HAvgFundingRate) / Number(FUNDING_RATE_PRECISION);
+    const driftPrice = Number(driftOracleData.price) / Number(PRICE_PRECISION);
+    const kmnoPrice = Number(kmnoOracleData.price) / Number(PRICE_PRECISION);
+
+    if (!driftPrice || !kmnoPrice) return;
+
+    // Calculate percentages and costs
+    const driftPercent = (driftDailyRate / driftPrice) * 100;
+    const kmnoPercent = (kmnoDailyRate / kmnoPrice) * 100;
+    const netDailyCost = currentPosition.drift * driftDailyRate + currentPosition.kmno * kmnoDailyRate;
+
+    logger.info(
+      `[FUNDING] DRIFT: ${driftPercent.toFixed(5)}% KMNO: ${kmnoPercent.toFixed(5)}% Net: $${netDailyCost.toFixed(4)}/day`,
+    );
+
+    if (Math.abs(netDailyCost) > 10) {
+      logger.warn(`[FUNDING] High net cost: $${netDailyCost.toFixed(2)}/day`);
+    }
+  } catch (error) {
+    logger.warn(`[FUNDING] Error: ${(error as Error).message}`);
+  }
+};
+
 // API fetch with retry
 const fetchCandleData = async (symbol: string): Promise<CandleData[]> => {
   return retryWithBackoff(async () => {
@@ -186,8 +237,67 @@ const fetchCandleData = async (symbol: string): Promise<CandleData[]> => {
   });
 };
 
+// Check liquidity depth and slippage
+const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", orderSize: number) => {
+  const checkStart = getHighResTime();
+
+  try {
+    const response = await fetch(`https://dlob.drift.trade/l2?marketName=${marketSymbol}`);
+    if (!response.ok) throw new Error(`DLOB API error: ${response.status}`);
+
+    const data = (await response.json()) as any;
+    const orders = data[side];
+    const oracle = data.oracle;
+
+    let totalSize = 0;
+    let totalValue = 0;
+
+    for (const order of orders) {
+      const levelPrice = parseFloat(order.price) / QUOTE_PRECISION;
+      const levelSize = parseFloat(order.size) / BASE_PRECISION;
+
+      const fillSize = Math.min(levelSize, orderSize - totalSize);
+      totalValue += fillSize * levelPrice;
+      totalSize += fillSize;
+
+      if (totalSize >= orderSize) break;
+    }
+
+    const checkTime = Number(getHighResTime() - checkStart) / 1e6;
+
+    if (totalSize < orderSize) {
+      logger.warn(
+        `[LIQUIDITY] ${marketSymbol} ${side.toUpperCase()} insufficient liquidity: need=${orderSize} available=${totalSize.toFixed(1)} check=${checkTime.toFixed(1)}ms`,
+      );
+      return { canFill: false, estimatedSlippage: Infinity };
+    }
+
+    const avgPrice = totalValue / totalSize;
+    const oraclePrice = parseFloat(oracle) / QUOTE_PRECISION;
+    const slippage = Math.abs((avgPrice - oraclePrice) / oraclePrice);
+
+    logger.info(
+      `[LIQUIDITY] ${marketSymbol} ${side.toUpperCase()} size=${orderSize} avgPrice=${avgPrice.toFixed(4)} oracle=${oraclePrice.toFixed(4)} slippage=${(slippage * 100).toFixed(3)}% check=${checkTime.toFixed(1)}ms`,
+    );
+
+    return { canFill: true, estimatedSlippage: slippage };
+  } catch (error) {
+    const checkTime = Number(getHighResTime() - checkStart) / 1e6;
+    logger.error(
+      `[LIQUIDITY] ${marketSymbol} ${side.toUpperCase()} check failed in ${checkTime.toFixed(1)}ms: ${(error as Error).message}`,
+    );
+    return { canFill: false, estimatedSlippage: Infinity };
+  }
+};
+
 // Order placement with retry
-const placeOrder = async (market: string, direction: PositionDirection, quantity: number, reduceOnly = false) => {
+const placeOrder = async (
+  market: string,
+  direction: PositionDirection,
+  quantity: number,
+  maxSlippageBps = MAX_SLIPPAGE_BPS,
+  reduceOnly = false,
+) => {
   const orderStart = getHighResTime();
   const action = reduceOnly ? "CLOSE" : "OPEN";
   const directionStr = direction === PositionDirection.LONG ? "LONG" : "SHORT";
@@ -206,6 +316,7 @@ const placeOrder = async (market: string, direction: PositionDirection, quantity
         direction,
         baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
         reduceOnly,
+        maxTs: new BN(maxSlippageBps),
       });
 
       logger.info(`[ORDER] Transaction signature: ${tx}`);
@@ -219,6 +330,10 @@ const placeOrder = async (market: string, direction: PositionDirection, quantity
       throw error;
     }
   });
+};
+
+const calculateDynamicSlippage = (estimatedSlippage: number, maxBps: number = MAX_SLIPPAGE_BPS) => {
+  return Math.min(maxBps, Math.max(10, estimatedSlippage * 10000 * 1.5));
 };
 
 // Position close
@@ -238,6 +353,7 @@ const closePosition = async () => {
           "DRIFT",
           currentPosition.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
           Math.abs(currentPosition.drift),
+          CLOSE_MAX_SLIPPAGE_BPS,
           true,
         ),
       );
@@ -249,6 +365,7 @@ const closePosition = async () => {
           "KMNO",
           currentPosition.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
           Math.abs(currentPosition.kmno),
+          CLOSE_MAX_SLIPPAGE_BPS,
           true,
         ),
       );
@@ -272,14 +389,50 @@ const openPosition = async (signal: Signal) => {
   const kmnoDirection = signal > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
   const signalStr = signal > 0 ? "LONG" : "SHORT";
 
+  const driftSide = driftDirection === PositionDirection.LONG ? "asks" : "bids";
+  const kmnoSide = kmnoDirection === PositionDirection.LONG ? "asks" : "bids";
+
   logger.info(
     `[OPEN] Opening ${signalStr} spread: DRIFT ${DRIFT_QUANTITY} ${driftDirection === PositionDirection.LONG ? "LONG" : "SHORT"} KMNO ${KMNO_QUANTITY} ${kmnoDirection === PositionDirection.LONG ? "LONG" : "SHORT"}`,
   );
 
   try {
+    // Check liquidity for both legs in parallel
+    const liquidityCheckStart = getHighResTime();
+    const [driftLiquidity, kmnoLiquidity] = await Promise.all([
+      checkLiquidity("DRIFT-PERP", driftSide, DRIFT_QUANTITY),
+      checkLiquidity("KMNO-PERP", kmnoSide, KMNO_QUANTITY),
+    ]);
+
+    const liquidityCheckTime = Number(getHighResTime() - liquidityCheckStart) / 1e6;
+
+    // Validate liquidity
+    if (!driftLiquidity.canFill) {
+      throw new Error(`Insufficient DRIFT liquidity for ${DRIFT_QUANTITY} ${driftSide}`);
+    }
+    if (!kmnoLiquidity.canFill) {
+      throw new Error(`Insufficient KMNO liquidity for ${KMNO_QUANTITY} ${kmnoSide}`);
+    }
+
+    // Calculate dynamic slippage
+    const driftMaxSlippageBps = calculateDynamicSlippage(driftLiquidity.estimatedSlippage);
+    const kmnoMaxSlippageBps = calculateDynamicSlippage(kmnoLiquidity.estimatedSlippage);
+
+    // Log slippage info
+    if (driftMaxSlippageBps >= MAX_SLIPPAGE_BPS || kmnoMaxSlippageBps >= MAX_SLIPPAGE_BPS) {
+      logger.warn(
+        `[OPEN] High slippage detected: DRIFT=${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% KMNO=${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`,
+      );
+    }
+
+    logger.info(
+      `[OPEN] Liquidity validated in ${liquidityCheckTime.toFixed(1)}ms - DRIFT: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% KMNO: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`,
+    );
+
+    // Execute trades with dynamic slippage protection
     await Promise.all([
-      placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY),
-      placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY),
+      placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY, driftMaxSlippageBps),
+      placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY, kmnoMaxSlippageBps),
     ]);
 
     currentPosition = {
@@ -351,6 +504,7 @@ const executeTradingCycle = async () => {
 
     await logActualPositions();
     await logAccountState();
+    await logFundingCosts();
 
     logger.info(
       `[CYCLE] Cycle ${cycleCount} completed in ${(Number(getHighResTime() - cycleStartTime) / 1e6).toFixed(1)}ms`,
@@ -406,13 +560,30 @@ const initializeSystem = async () => {
   const kmnoMarket = marketMap.get("KMNO");
 
   if (!driftMarket || !kmnoMarket) throw new Error("Required markets DRIFT or KMNO not found");
+  const driftMarketAccount = driftClient.getPerpMarketAccount(driftMarket.marketIndex);
+  const kmnoMarketAccount = driftClient.getPerpMarketAccount(kmnoMarket.marketIndex);
+
+  if (!driftMarketAccount || !kmnoMarketAccount)
+    throw new Error("Required markets DRIFT or KMNO Market Account not found");
+
+  // Validate minimum order size
+  const driftQuantityBase = DRIFT_QUANTITY * BASE_PRECISION;
+  const kmnoQuantityBase = KMNO_QUANTITY * BASE_PRECISION;
+  const driftMinOrder = driftMarketAccount.amm.minOrderSize.toNumber();
+  const kmnoMinOrder = kmnoMarketAccount.amm.minOrderSize.toNumber();
+
+  if (driftQuantityBase < driftMinOrder || kmnoQuantityBase < kmnoMinOrder) {
+    throw new Error(
+      `Order quantities too small. DRIFT min: ${driftMinOrder / BASE_PRECISION}, KMNO min: ${kmnoMinOrder / BASE_PRECISION}`,
+    );
+  }
 
   logger.info(`[INIT] Markets loaded: DRIFT(${driftMarket.marketIndex}) KMNO(${kmnoMarket.marketIndex})`);
   logger.info(
     `[INIT] Trading parameters: DRIFT_QTY=${DRIFT_QUANTITY} KMNO_QTY=${KMNO_QUANTITY} RATIO=${PRICE_RATIO} LAG=${SIGNAL_LAG_PERIODS}`,
   );
 
-  // Reconcile position state on startup
+  // // Reconcile position state on startup
   await reconcilePositionState();
 
   logger.info(
