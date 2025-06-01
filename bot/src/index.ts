@@ -249,6 +249,12 @@ const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", order
     const orders = data[side];
     const oracle = data.oracle;
 
+    const bestPrice = orders.length > 0 ? parseFloat(orders[0].price) / QUOTE_PRECISION.toNumber() : 0;
+
+    logger.info(
+      `[LIQUIDITY] ${marketSymbol} ${side.toUpperCase()} book depth: ${orders.length} levels, top=${bestPrice.toFixed(4)}, need=${orderSize}`,
+    );
+
     let totalSize = 0;
     let totalValue = 0;
 
@@ -259,6 +265,10 @@ const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", order
       const fillSize = Math.min(levelSize, orderSize - totalSize);
       totalValue += fillSize * levelPrice;
       totalSize += fillSize;
+
+      logger.info(
+        `[LIQUIDITY] ${marketSymbol} Level: price=${levelPrice.toFixed(4)} size=${levelSize.toFixed(1)} fillSize=${fillSize.toFixed(1)} cumulative=${totalSize.toFixed(1)}`,
+      );
 
       if (totalSize >= orderSize) break;
     }
@@ -275,12 +285,13 @@ const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", order
     const avgPrice = totalValue / totalSize;
     const oraclePrice = parseFloat(oracle) / QUOTE_PRECISION.toNumber();
     const slippage = Math.abs((avgPrice - oraclePrice) / oraclePrice);
+    const bestSlippage = Math.abs((avgPrice - bestPrice) / bestPrice);
 
     logger.info(
-      `[LIQUIDITY] ${marketSymbol} ${side.toUpperCase()} size=${orderSize} avgPrice=${avgPrice.toFixed(4)} oracle=${oraclePrice.toFixed(4)} slippage=${(slippage * 100).toFixed(3)}% check=${checkTime.toFixed(1)}ms`,
+      `[LIQUIDITY] ${marketSymbol} ${side.toUpperCase()} size=${orderSize} avgPrice=${avgPrice.toFixed(4)} bestPrice=${bestPrice.toFixed(4)} oracle=${oraclePrice.toFixed(4)} slippage=${(slippage * 100).toFixed(3)}% bestSlippage=${(bestSlippage * 100).toFixed(3)}% check=${checkTime.toFixed(1)}ms`,
     );
 
-    return { canFill: true, estimatedSlippage: slippage };
+    return { canFill: true, estimatedSlippage: bestSlippage };
   } catch (error) {
     const checkTime = Number(getHighResTime() - checkStart) / 1e6;
     logger.error(
@@ -361,12 +372,12 @@ const openPosition = async (signal: Signal) => {
     // Validate slippage
     const maxSlippageDecimal = MAX_SLIPPAGE_BPS / 10000;
     if (driftLiquidity.estimatedSlippage > maxSlippageDecimal) {
-      logger.warn(
+      throw new Error(
         `DRIFT slippage too high: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
       );
     }
     if (kmnoLiquidity.estimatedSlippage > maxSlippageDecimal) {
-      logger.warn(
+      throw new Error(
         `KMNO slippage too high: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
       );
     }
@@ -405,7 +416,16 @@ const closePosition = async () => {
   try {
     const promises = [];
 
+    // Check liquidity before closing positions
     if (currentPosition.drift !== 0) {
+      const driftSide = currentPosition.drift > 0 ? "bids" : "asks";
+      const driftLiquidity = await checkLiquidity("DRIFT-PERP", driftSide, Math.abs(currentPosition.drift));
+
+      const maxCloseSlippageDecimal = CLOSE_MAX_SLIPPAGE_BPS / 10000;
+      if (!driftLiquidity.canFill || driftLiquidity.estimatedSlippage > maxCloseSlippageDecimal) {
+        logger.warn(`[CLOSE] DRIFT liquidity poor: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
+      }
+
       promises.push(
         placeOrder(
           "DRIFT",
@@ -417,6 +437,14 @@ const closePosition = async () => {
     }
 
     if (currentPosition.kmno !== 0) {
+      const kmnoSide = currentPosition.kmno > 0 ? "bids" : "asks";
+      const kmnoLiquidity = await checkLiquidity("KMNO-PERP", kmnoSide, Math.abs(currentPosition.kmno));
+
+      const maxCloseSlippageDecimal = CLOSE_MAX_SLIPPAGE_BPS / 10000;
+      if (!kmnoLiquidity.canFill || kmnoLiquidity.estimatedSlippage > maxCloseSlippageDecimal) {
+        logger.warn(`[CLOSE] KMNO liquidity poor: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
+      }
+
       promises.push(
         placeOrder(
           "KMNO",
