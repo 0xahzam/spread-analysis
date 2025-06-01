@@ -253,8 +253,8 @@ const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", order
     let totalValue = 0;
 
     for (const order of orders) {
-      const levelPrice = parseFloat(order.price) / QUOTE_PRECISION;
-      const levelSize = parseFloat(order.size) / BASE_PRECISION;
+      const levelPrice = parseFloat(order.price) / QUOTE_PRECISION.toNumber();
+      const levelSize = parseFloat(order.size) / BASE_PRECISION.toNumber();
 
       const fillSize = Math.min(levelSize, orderSize - totalSize);
       totalValue += fillSize * levelPrice;
@@ -273,7 +273,7 @@ const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", order
     }
 
     const avgPrice = totalValue / totalSize;
-    const oraclePrice = parseFloat(oracle) / QUOTE_PRECISION;
+    const oraclePrice = parseFloat(oracle) / QUOTE_PRECISION.toNumber();
     const slippage = Math.abs((avgPrice - oraclePrice) / oraclePrice);
 
     logger.info(
@@ -554,14 +554,14 @@ const initializeSystem = async () => {
     throw new Error("Required markets DRIFT or KMNO Market Account not found");
 
   // Validate minimum order size
-  const driftQuantityBase = DRIFT_QUANTITY * BASE_PRECISION;
-  const kmnoQuantityBase = KMNO_QUANTITY * BASE_PRECISION;
+  const driftQuantityBase = DRIFT_QUANTITY * BASE_PRECISION.toNumber();
+  const kmnoQuantityBase = KMNO_QUANTITY * BASE_PRECISION.toNumber();
   const driftMinOrder = driftMarketAccount.amm.minOrderSize.toNumber();
   const kmnoMinOrder = kmnoMarketAccount.amm.minOrderSize.toNumber();
 
   if (driftQuantityBase < driftMinOrder || kmnoQuantityBase < kmnoMinOrder) {
     throw new Error(
-      `Order quantities too small. DRIFT min: ${driftMinOrder / BASE_PRECISION}, KMNO min: ${kmnoMinOrder / BASE_PRECISION}`,
+      `Order quantities too small. DRIFT min: ${driftMinOrder / BASE_PRECISION.toNumber()}, KMNO min: ${kmnoMinOrder / BASE_PRECISION.toNumber()}`,
     );
   }
 
