@@ -291,13 +291,7 @@ const checkLiquidity = async (marketSymbol: string, side: "bids" | "asks", order
 };
 
 // Order placement with retry
-const placeOrder = async (
-  market: string,
-  direction: PositionDirection,
-  quantity: number,
-  maxSlippageBps = MAX_SLIPPAGE_BPS,
-  reduceOnly = false,
-) => {
+const placeOrder = async (market: string, direction: PositionDirection, quantity: number, reduceOnly = false) => {
   const orderStart = getHighResTime();
   const action = reduceOnly ? "CLOSE" : "OPEN";
   const directionStr = direction === PositionDirection.LONG ? "LONG" : "SHORT";
@@ -316,7 +310,6 @@ const placeOrder = async (
         direction,
         baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
         reduceOnly,
-        maxTs: new BN(maxSlippageBps),
       });
 
       logger.info(`[ORDER] Transaction signature: ${tx}`);
@@ -330,55 +323,6 @@ const placeOrder = async (
       throw error;
     }
   });
-};
-
-const calculateDynamicSlippage = (estimatedSlippage: number, maxBps: number = MAX_SLIPPAGE_BPS) => {
-  return Math.min(maxBps, Math.max(10, estimatedSlippage * 10000 * 1.5));
-};
-
-// Position close
-const closePosition = async () => {
-  if (!currentPosition) return logger.debug(`[CLOSE] No position to close`);
-
-  logger.info(
-    `[CLOSE] Closing position DRIFT=${currentPosition.drift} KMNO=${currentPosition.kmno} Signal=${currentPosition.signal}`,
-  );
-
-  try {
-    const promises = [];
-
-    if (currentPosition.drift !== 0) {
-      promises.push(
-        placeOrder(
-          "DRIFT",
-          currentPosition.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
-          Math.abs(currentPosition.drift),
-          CLOSE_MAX_SLIPPAGE_BPS,
-          true,
-        ),
-      );
-    }
-
-    if (currentPosition.kmno !== 0) {
-      promises.push(
-        placeOrder(
-          "KMNO",
-          currentPosition.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
-          Math.abs(currentPosition.kmno),
-          CLOSE_MAX_SLIPPAGE_BPS,
-          true,
-        ),
-      );
-    }
-
-    await Promise.all(promises);
-    currentPosition = null; // Only clear position after BOTH close orders succeed
-    logger.info(`[CLOSE] Successfully closed position`);
-  } catch (error) {
-    logger.error(`[CLOSE] Failed to close position: ${(error as Error).message}`);
-    // Don't clear currentPosition on failure to maintain state consistency
-    throw error;
-  }
 };
 
 // Position open
@@ -414,14 +358,16 @@ const openPosition = async (signal: Signal) => {
       throw new Error(`Insufficient KMNO liquidity for ${KMNO_QUANTITY} ${kmnoSide}`);
     }
 
-    // Calculate dynamic slippage
-    const driftMaxSlippageBps = calculateDynamicSlippage(driftLiquidity.estimatedSlippage);
-    const kmnoMaxSlippageBps = calculateDynamicSlippage(kmnoLiquidity.estimatedSlippage);
-
-    // Log slippage info
-    if (driftMaxSlippageBps >= MAX_SLIPPAGE_BPS || kmnoMaxSlippageBps >= MAX_SLIPPAGE_BPS) {
+    // Validate slippage
+    const maxSlippageDecimal = MAX_SLIPPAGE_BPS / 10000;
+    if (driftLiquidity.estimatedSlippage > maxSlippageDecimal) {
       logger.warn(
-        `[OPEN] High slippage detected: DRIFT=${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% KMNO=${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`,
+        `DRIFT slippage too high: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
+      );
+    }
+    if (kmnoLiquidity.estimatedSlippage > maxSlippageDecimal) {
+      logger.warn(
+        `KMNO slippage too high: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
       );
     }
 
@@ -429,10 +375,10 @@ const openPosition = async (signal: Signal) => {
       `[OPEN] Liquidity validated in ${liquidityCheckTime.toFixed(1)}ms - DRIFT: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% KMNO: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`,
     );
 
-    // Execute trades with dynamic slippage protection
+    // Execute trades
     await Promise.all([
-      placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY, driftMaxSlippageBps),
-      placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY, kmnoMaxSlippageBps),
+      placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY),
+      placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY),
     ]);
 
     currentPosition = {
@@ -444,7 +390,48 @@ const openPosition = async (signal: Signal) => {
     logger.info(`[OPEN] Successfully opened ${signalStr} spread position`);
   } catch (error) {
     logger.error(`[OPEN] Failed to open ${signalStr} spread: ${(error as Error).message}`);
-    // Don't set currentPosition on failure to avoid inconsistent state
+    throw error;
+  }
+};
+
+// Position close
+const closePosition = async () => {
+  if (!currentPosition) return logger.debug(`[CLOSE] No position to close`);
+
+  logger.info(
+    `[CLOSE] Closing position DRIFT=${currentPosition.drift} KMNO=${currentPosition.kmno} Signal=${currentPosition.signal}`,
+  );
+
+  try {
+    const promises = [];
+
+    if (currentPosition.drift !== 0) {
+      promises.push(
+        placeOrder(
+          "DRIFT",
+          currentPosition.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
+          Math.abs(currentPosition.drift),
+          true, // reduceOnly
+        ),
+      );
+    }
+
+    if (currentPosition.kmno !== 0) {
+      promises.push(
+        placeOrder(
+          "KMNO",
+          currentPosition.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
+          Math.abs(currentPosition.kmno),
+          true, // reduceOnly
+        ),
+      );
+    }
+
+    await Promise.all(promises);
+    currentPosition = null;
+    logger.info(`[CLOSE] Successfully closed position`);
+  } catch (error) {
+    logger.error(`[CLOSE] Failed to close position: ${(error as Error).message}`);
     throw error;
   }
 };
@@ -521,7 +508,7 @@ const initializeSystem = async () => {
   logger.info(`[INIT] Initializing trading system`);
 
   const sdk = initialize({ env: ENV });
-  const accountLoader = new BulkAccountLoader(connection, "processed", 1000);
+  const accountLoader = new BulkAccountLoader(connection, "confirmed", 1000);
 
   // Key parsing with validation
   let secretKey: Uint8Array;
