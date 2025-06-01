@@ -94,18 +94,6 @@ df = price_df.loc[timeline_df.index].copy()
 df["kmno_scaled"] = df["kmno"] * ratio
 spread_vol = df["spread"].pct_change().fillna(0) * 100
 
-fig_price = go.Figure()
-fig_price.add_trace(
-    go.Scatter(x=df.index, y=df["drift"], name="DRIFT", line=dict(color="#1f77b4"))
-)
-fig_price.add_trace(
-    go.Scatter(
-        x=df.index, y=df["kmno"], name="KMNO", line=dict(color="#00cc96", dash="dot")
-    )
-)
-fig_price.update_layout(height=300, margin=dict(t=20), yaxis_title="USD")
-st.plotly_chart(fig_price, use_container_width=True)
-
 fig_spread = go.Figure()
 fig_spread.add_trace(
     go.Scatter(
@@ -121,10 +109,31 @@ fig_spread.add_trace(
         y=spread_vol,
         name="Spread Volatility",
         line=dict(color="#AB63FA", dash="dot"),
+        yaxis="y2",
     )
 )
-fig_spread.update_layout(height=300, margin=dict(t=20), yaxis_title="USD / %")
+fig_spread.update_layout(
+    height=300,
+    margin=dict(t=20),
+    yaxis=dict(title="USD"),
+    yaxis2=dict(title="%", overlaying="y", side="right"),
+)
 st.plotly_chart(fig_spread, use_container_width=True)
+
+fig_price = go.Figure()
+fig_price.add_trace(
+    go.Scatter(x=df.index, y=df["drift"], name="DRIFT", line=dict(color="#1f77b4"))
+)
+fig_price.add_trace(
+    go.Scatter(x=df.index, y=df["kmno"], name="KMNO", line=dict(color="#00cc96"))
+)
+fig_price.add_trace(
+    go.Scatter(
+        x=df.index, y=10 * df["kmno"], name="10*KMNO", line=dict(color="#cc0092")
+    )
+)
+fig_price.update_layout(height=300, margin=dict(t=20), yaxis_title="USD")
+st.plotly_chart(fig_price, use_container_width=True)
 
 st.markdown("---")
 st.markdown("### Trade Log & Distribution")
