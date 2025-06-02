@@ -315,11 +315,30 @@ const placeOrder = async (market: string, direction: PositionDirection, quantity
       const marketConfig = marketMap.get(market);
       if (!marketConfig) throw new Error(`Market config not found for ${market}`);
 
+      // const tx = await driftClient.placePerpOrder({
+      //   orderType: OrderType.MARKET,
+      //   marketIndex: marketConfig.marketIndex,
+      //   direction,
+      //   baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
+      //   reduceOnly,
+      // });
+
+      const oracleData = driftClient.getOracleDataForPerpMarket(marketConfig.marketIndex);
+      const oraclePrice = Number(oracleData.price) / Number(PRICE_PRECISION);
+      const slippageBps = reduceOnly ? CLOSE_MAX_SLIPPAGE_BPS : MAX_SLIPPAGE_BPS;
+      const maxSlippagePrice = oraclePrice * (slippageBps / 10000);
+      const oraclePriceOffset = new BN(maxSlippagePrice * Number(PRICE_PRECISION));
+
+      logger.info(
+        `[ORDER] Oracle: ${oraclePrice.toFixed(4)} Slippage: ${slippageBps}bps (${maxSlippagePrice.toFixed(4)}) Offset: ${oraclePriceOffset.toString()}`,
+      );
+
       const tx = await driftClient.placePerpOrder({
-        orderType: OrderType.MARKET,
+        orderType: OrderType.ORACLE,
         marketIndex: marketConfig.marketIndex,
         direction,
         baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
+        oraclePriceOffset: oraclePriceOffset,
         reduceOnly,
       });
 
@@ -363,24 +382,24 @@ const openPosition = async (signal: Signal) => {
 
     // Validate liquidity
     if (!driftLiquidity.canFill) {
-      throw new Error(`Insufficient DRIFT liquidity for ${DRIFT_QUANTITY} ${driftSide}`);
+      logger.warn(`Insufficient DRIFT liquidity for ${DRIFT_QUANTITY} ${driftSide}`);
     }
     if (!kmnoLiquidity.canFill) {
-      throw new Error(`Insufficient KMNO liquidity for ${KMNO_QUANTITY} ${kmnoSide}`);
+      logger.warn(`Insufficient KMNO liquidity for ${KMNO_QUANTITY} ${kmnoSide}`);
     }
 
     // Validate slippage
-    const maxSlippageDecimal = MAX_SLIPPAGE_BPS / 10000;
-    if (driftLiquidity.estimatedSlippage > maxSlippageDecimal) {
-      throw new Error(
-        `DRIFT slippage too high: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
-      );
-    }
-    if (kmnoLiquidity.estimatedSlippage > maxSlippageDecimal) {
-      throw new Error(
-        `KMNO slippage too high: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
-      );
-    }
+    // const maxSlippageDecimal = MAX_SLIPPAGE_BPS / 10000;
+    // if (driftLiquidity.estimatedSlippage > maxSlippageDecimal) {
+    //   throw new Error(
+    //     `DRIFT slippage too high: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
+    //   );
+    // }
+    // if (kmnoLiquidity.estimatedSlippage > maxSlippageDecimal) {
+    //   throw new Error(
+    //     `KMNO slippage too high: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
+    //   );
+    // }
 
     logger.info(
       `[OPEN] Liquidity validated in ${liquidityCheckTime.toFixed(1)}ms - DRIFT: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% KMNO: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`,
@@ -418,13 +437,12 @@ const closePosition = async () => {
 
     // Check liquidity before closing positions
     if (currentPosition.drift !== 0) {
-      const driftSide = currentPosition.drift > 0 ? "bids" : "asks";
-      const driftLiquidity = await checkLiquidity("DRIFT-PERP", driftSide, Math.abs(currentPosition.drift));
-
-      const maxCloseSlippageDecimal = CLOSE_MAX_SLIPPAGE_BPS / 10000;
-      if (!driftLiquidity.canFill || driftLiquidity.estimatedSlippage > maxCloseSlippageDecimal) {
-        logger.warn(`[CLOSE] DRIFT liquidity poor: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
-      }
+      // const driftSide = currentPosition.drift > 0 ? "bids" : "asks";
+      // const driftLiquidity = await checkLiquidity("DRIFT-PERP", driftSide, Math.abs(currentPosition.drift));
+      // const maxCloseSlippageDecimal = CLOSE_MAX_SLIPPAGE_BPS / 10000;
+      // if (!driftLiquidity.canFill || driftLiquidity.estimatedSlippage > maxCloseSlippageDecimal) {
+      //   logger.warn(`[CLOSE] DRIFT liquidity poor: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
+      // }
 
       promises.push(
         placeOrder(
@@ -437,13 +455,12 @@ const closePosition = async () => {
     }
 
     if (currentPosition.kmno !== 0) {
-      const kmnoSide = currentPosition.kmno > 0 ? "bids" : "asks";
-      const kmnoLiquidity = await checkLiquidity("KMNO-PERP", kmnoSide, Math.abs(currentPosition.kmno));
-
-      const maxCloseSlippageDecimal = CLOSE_MAX_SLIPPAGE_BPS / 10000;
-      if (!kmnoLiquidity.canFill || kmnoLiquidity.estimatedSlippage > maxCloseSlippageDecimal) {
-        logger.warn(`[CLOSE] KMNO liquidity poor: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
-      }
+      // const kmnoSide = currentPosition.kmno > 0 ? "bids" : "asks";
+      // const kmnoLiquidity = await checkLiquidity("KMNO-PERP", kmnoSide, Math.abs(currentPosition.kmno));
+      // const maxCloseSlippageDecimal = CLOSE_MAX_SLIPPAGE_BPS / 10000;
+      // if (!kmnoLiquidity.canFill || kmnoLiquidity.estimatedSlippage > maxCloseSlippageDecimal) {
+      //   logger.warn(`[CLOSE] KMNO liquidity poor: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
+      // }
 
       promises.push(
         placeOrder(
