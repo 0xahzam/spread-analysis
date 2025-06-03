@@ -315,32 +315,32 @@ const placeOrder = async (market: string, direction: PositionDirection, quantity
       const marketConfig = marketMap.get(market);
       if (!marketConfig) throw new Error(`Market config not found for ${market}`);
 
-      // const tx = await driftClient.placePerpOrder({
-      //   orderType: OrderType.MARKET,
-      //   marketIndex: marketConfig.marketIndex,
-      //   direction,
-      //   baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
-      //   reduceOnly,
-      // });
-
-      const oracleData = driftClient.getOracleDataForPerpMarket(marketConfig.marketIndex);
-      const oraclePrice = Number(oracleData.price) / Number(PRICE_PRECISION);
-      const slippageBps = reduceOnly ? CLOSE_MAX_SLIPPAGE_BPS : MAX_SLIPPAGE_BPS;
-      const maxSlippagePrice = oraclePrice * (slippageBps / 10000);
-      const oraclePriceOffset = new BN(maxSlippagePrice * Number(PRICE_PRECISION));
-
-      logger.info(
-        `[ORDER] Oracle: ${oraclePrice.toFixed(4)} Slippage: ${slippageBps}bps (${maxSlippagePrice.toFixed(4)}) Offset: ${oraclePriceOffset.toString()}`,
-      );
-
       const tx = await driftClient.placePerpOrder({
-        orderType: OrderType.ORACLE,
+        orderType: OrderType.MARKET,
         marketIndex: marketConfig.marketIndex,
         direction,
         baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
-        oraclePriceOffset: oraclePriceOffset,
         reduceOnly,
       });
+
+      // const oracleData = driftClient.getOracleDataForPerpMarket(marketConfig.marketIndex);
+      // const oraclePrice = Number(oracleData.price) / Number(PRICE_PRECISION);
+      // const slippageBps = reduceOnly ? CLOSE_MAX_SLIPPAGE_BPS : MAX_SLIPPAGE_BPS;
+      // const maxSlippagePrice = oraclePrice * (slippageBps / 10000);
+      // const oraclePriceOffset = new BN(maxSlippagePrice * Number(PRICE_PRECISION));
+
+      // logger.info(
+      //   `[ORDER] Oracle: ${oraclePrice.toFixed(4)} Slippage: ${slippageBps}bps (${maxSlippagePrice.toFixed(4)}) Offset: ${oraclePriceOffset.toString()}`,
+      // );
+
+      // const tx = await driftClient.placePerpOrder({
+      //   orderType: OrderType.ORACLE,
+      //   marketIndex: marketConfig.marketIndex,
+      //   direction,
+      //   baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
+      //   oraclePriceOffset: oraclePriceOffset,
+      //   reduceOnly,
+      // });
 
       logger.info(`[ORDER] Transaction signature: ${tx}`);
       logger.info(`[ORDER] Explorer link: https://solscan.io/tx/${tx}`);
@@ -389,17 +389,17 @@ const openPosition = async (signal: Signal) => {
     }
 
     // Validate slippage
-    // const maxSlippageDecimal = MAX_SLIPPAGE_BPS / 10000;
-    // if (driftLiquidity.estimatedSlippage > maxSlippageDecimal) {
-    //   throw new Error(
-    //     `DRIFT slippage too high: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
-    //   );
-    // }
-    // if (kmnoLiquidity.estimatedSlippage > maxSlippageDecimal) {
-    //   throw new Error(
-    //     `KMNO slippage too high: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
-    //   );
-    // }
+    const maxSlippageDecimal = MAX_SLIPPAGE_BPS / 10000;
+    if (driftLiquidity.estimatedSlippage > maxSlippageDecimal) {
+      throw new Error(
+        `DRIFT slippage too high: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
+      );
+    }
+    if (kmnoLiquidity.estimatedSlippage > maxSlippageDecimal) {
+      throw new Error(
+        `KMNO slippage too high: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}% > ${(maxSlippageDecimal * 100).toFixed(3)}%`,
+      );
+    }
 
     logger.info(
       `[OPEN] Liquidity validated in ${liquidityCheckTime.toFixed(1)}ms - DRIFT: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}% KMNO: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`,
