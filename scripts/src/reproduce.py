@@ -28,7 +28,7 @@ class MTM(NamedTuple):
     equity: float
 
 
-FEE_RATE = 0.001  # 10 bps taker
+FEE_RATE = 0.0015  # 15 bps
 
 
 # open/close fees
@@ -92,8 +92,8 @@ def open_position(sig: int, row: pd.Series, capital: float, ratio: float) -> Pos
     # qd = capital / (row.drift + ratio * row.kmno)
     # qk = ratio * qd
 
-    qd = 1.0  # Fixed 1 DRIFT
-    qk = 10.0  # Fixed 10 KMNO
+    qd = 10.0  # Fixed 1 DRIFT
+    qk = 100.0  # Fixed 10 KMNO
 
     fee_open = dual_fee(qd, row.drift, qk, row.kmno)
     # f_d = row.fidx_drift_long if sig > 0 else row.fidx_drift_short
@@ -180,7 +180,7 @@ def backtest(
                     position.qty_drift, row.drift, position.qty_kmno, row.kmno
                 )
 
-                fee_close = 0
+                # fee_close = 0
                 cap_1 = equity_now - fee_close
                 snap["is_exit"] = True
                 snap["fee"] = fee_close
@@ -199,7 +199,7 @@ def backtest(
         elif signal and rebalance_now:
             # capital_0 = init_qty * row.drift + ratio * init_qty * row.kmno
             # CHANGED
-            capital_0 = 1.0 * row.drift + 10.0 * row.kmno  # 1 DRIFT + 10 KMNO
+            capital_0 = 10.0 * row.drift + 100.0 * row.kmno  # 1 DRIFT + 10 KMNO
 
             position = open_position(signal, row, capital_0, ratio)
             snap["is_entry"] = True
@@ -322,7 +322,7 @@ if __name__ == "__main__":
     ratio = 10
     init_qty = 1
     max_freq = 96
-    update_freq = 7
+    update_freq = 1
 
     df = prepare_df(
         "../data/price/drift_15m_90days.json",
@@ -333,66 +333,66 @@ if __name__ == "__main__":
     timeline, capital_0 = backtest(df, ratio, init_qty, update_freq)
     stats = compute_stats(timeline, capital_0)
 
-    # equity_curve = timeline["equity"].ffill().dropna()
-    # returns = equity_curve.pct_change().dropna()
-    # rolling_vol = returns.rolling(30).std() * (252**0.5) * 100
+    equity_curve = timeline["equity"].ffill().dropna()
+    returns = equity_curve.pct_change().dropna()
+    rolling_vol = returns.rolling(30).std() * (252**0.5) * 100
 
-    # fig = make_subplots(
-    #     rows=2,
-    #     cols=1,
-    #     subplot_titles=("PnL Curve", "Rolling Volatility (30-period)"),
-    #     vertical_spacing=0.1,
-    #     row_heights=[0.7, 0.3],
-    # )
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        subplot_titles=("PnL Curve", "Rolling Volatility (30-period)"),
+        vertical_spacing=0.1,
+        row_heights=[0.7, 0.3],
+    )
 
-    # fig.add_trace(
-    #     go.Scatter(
-    #         x=equity_curve.index,
-    #         y=equity_curve.values - capital_0,
-    #         mode="lines",
-    #         line=dict(color="#1f77b4", width=2),
-    #         name="PnL",
-    #     ),
-    #     row=1,
-    #     col=1,
-    # )
+    fig.add_trace(
+        go.Scatter(
+            x=equity_curve.index,
+            y=equity_curve.values - capital_0,
+            mode="lines",
+            line=dict(color="#1f77b4", width=2),
+            name="PnL",
+        ),
+        row=1,
+        col=1,
+    )
 
-    # fig.add_trace(
-    #     go.Scatter(
-    #         x=rolling_vol.index,
-    #         y=rolling_vol.values,
-    #         mode="lines",
-    #         line=dict(color="#ff7f0e", width=1.5),
-    #         name="Volatility %",
-    #     ),
-    #     row=2,
-    #     col=1,
-    # )
+    fig.add_trace(
+        go.Scatter(
+            x=rolling_vol.index,
+            y=rolling_vol.values,
+            mode="lines",
+            line=dict(color="#ff7f0e", width=1.5),
+            name="Volatility %",
+        ),
+        row=2,
+        col=1,
+    )
 
-    # overall_vol = returns.std() * (252**0.5) * 100
-    # title_text = (
-    #     f"Backtest Results | "
-    #     f"Update Frequency: {update_freq * 15 / 60} hrs | "
-    #     f"Return: {stats['final_pct']:.1f}% | "
-    #     f"Sharpe: {stats['sharpe']:.1f} | "
-    #     f"Drawdown: {stats['min_drawdown']:.1f}% | "
-    #     f"Vol: {overall_vol:.1f}% | "
-    #     f"Win Rate: {stats['win_rate']:.1f}%"
-    # )
+    overall_vol = returns.std() * (252**0.5) * 100
+    title_text = (
+        f"Backtest Results | "
+        f"Update Frequency: {update_freq * 15 / 60} hrs | "
+        f"Return: {stats['final_pct']:.1f}% | "
+        f"Sharpe: {stats['sharpe']:.1f} | "
+        f"Drawdown: {stats['min_drawdown']:.1f}% | "
+        f"Vol: {overall_vol:.1f}% | "
+        f"Win Rate: {stats['win_rate']:.1f}%"
+    )
 
-    # fig.update_layout(
-    #     title=dict(text=title_text, font=dict(size=14)),
-    #     showlegend=False,
-    #     template="presentation",
-    #     width=1200,
-    #     height=700,
-    # )
+    fig.update_layout(
+        title=dict(text=title_text, font=dict(size=14)),
+        showlegend=False,
+        template="presentation",
+        width=1200,
+        height=700,
+    )
 
-    # fig.update_yaxes(title_text="PnL ($)", row=1, col=1)
-    # fig.update_yaxes(title_text="Volatility (%)", row=2, col=1)
-    # fig.update_xaxes(title_text="Time", row=2, col=1)
+    fig.update_yaxes(title_text="PnL ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Volatility (%)", row=2, col=1)
+    fig.update_xaxes(title_text="Time", row=2, col=1)
 
-    # fig.show()
+    fig.show()
 
     # sweep_results = sweep_freq(df, ratio, init_qty, max_freq)
     # sweep_results.to_csv("backtest_fixed_size.csv", index=False)

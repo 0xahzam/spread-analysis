@@ -21,7 +21,7 @@ const DRIFT_QUANTITY = 10; // DRIFT position size
 const KMNO_QUANTITY = 100; // KMNO position size
 const PRICE_RATIO = 10; // Price ratio for spread calculation
 const SIGNAL_LAG_PERIODS = 2; // Signal lag periods
-const CYCLE_INTERVAL_MS = 900_000; // 15min cycle (900k ms)
+const CYCLE_INTERVAL_MS = 7 * 900_000; // 15min cycle (900k ms)
 const SIMULATION_MODE = false; // Simulation mode flag
 const ENV = "mainnet-beta";
 
@@ -406,10 +406,14 @@ const openPosition = async (signal: Signal) => {
     );
 
     // Execute trades
-    await Promise.all([
-      placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY),
-      placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY),
-    ]);
+    // await Promise.all([
+    //   placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY),
+    //   placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY),
+    // ]);
+
+    // Testing sequential fills
+    await placeOrder("DRIFT", driftDirection, DRIFT_QUANTITY);
+    await placeOrder("KMNO", kmnoDirection, KMNO_QUANTITY);
 
     currentPosition = {
       drift: signal * DRIFT_QUANTITY,
@@ -444,13 +448,20 @@ const closePosition = async () => {
       //   logger.warn(`[CLOSE] DRIFT liquidity poor: ${(driftLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
       // }
 
-      promises.push(
-        placeOrder(
-          "DRIFT",
-          currentPosition.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
-          Math.abs(currentPosition.drift),
-          true, // reduceOnly
-        ),
+      // promises.push(
+      //   placeOrder(
+      //     "DRIFT",
+      //     currentPosition.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
+      //     Math.abs(currentPosition.drift),
+      //     true, // reduceOnly
+      //   ),
+      // );
+
+      await placeOrder(
+        "DRIFT",
+        currentPosition.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
+        Math.abs(currentPosition.drift),
+        true, // reduceOnly
       );
     }
 
@@ -462,17 +473,25 @@ const closePosition = async () => {
       //   logger.warn(`[CLOSE] KMNO liquidity poor: ${(kmnoLiquidity.estimatedSlippage * 100).toFixed(3)}%`);
       // }
 
-      promises.push(
-        placeOrder(
-          "KMNO",
-          currentPosition.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
-          Math.abs(currentPosition.kmno),
-          true, // reduceOnly
-        ),
+      // promises.push(
+      //   placeOrder(
+      //     "KMNO",
+      //     currentPosition.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
+      //     Math.abs(currentPosition.kmno),
+      //     true, // reduceOnly
+      //   ),
+      // );
+
+      await placeOrder(
+        "KMNO",
+        currentPosition.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG,
+        Math.abs(currentPosition.kmno),
+        true, // reduceOnly
       );
     }
 
-    await Promise.all(promises);
+    // Testing sequential fills
+    // await Promise.all(promises);
     currentPosition = null;
     logger.info(`[CLOSE] Successfully closed position`);
   } catch (error) {
